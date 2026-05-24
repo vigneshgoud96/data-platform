@@ -1,0 +1,275 @@
+{
+  "name": "CustomerIncrementalETLPipeline",
+  "properties": {
+    "description": "Customer Incremental ETL Pipeline - Executes Databricks notebook with comprehensive logging and error handling",
+    "activities": [
+      {
+        "name": "LogPipelineStart",
+        "type": "AppendVariable",
+        "dependsOn": [],
+        "policy": {
+          "timeout": "7.00:00:00",
+          "retry": 0,
+          "retryIntervalInSeconds": 30,
+          "secureInput": false,
+          "secureOutput": false
+        },
+        "typeProperties": {
+          "variableName": "PipelineLog",
+          "value": "[concat('Pipeline Started at ', utcNow('yyyy-MM-dd HH:mm:ss'), ' UTC')]"
+        }
+      },
+      {
+        "name": "SetInitialVariables",
+        "type": "SetVariable",
+        "dependsOn": [
+          {
+            "activity": "LogPipelineStart",
+            "dependencyConditions": ["Succeeded"]
+          }
+        ],
+        "policy": {
+          "timeout": "7.00:00:00",
+          "retry": 0,
+          "retryIntervalInSeconds": 30,
+          "secureInput": false,
+          "secureOutput": false
+        },
+        "typeProperties": {
+          "variableName": "LoadType",
+          "value": {
+            "value": "@pipeline().parameters.LoadType",
+            "type": "Expression"
+          }
+        }
+      },
+      {
+        "name": "ExecuteCustomerETLNotebook",
+        "type": "DatabricksNotebook",
+        "dependsOn": [
+          {
+            "activity": "SetInitialVariables",
+            "dependencyConditions": ["Succeeded"]
+          }
+        ],
+        "policy": {
+          "timeout": "0.01:00:00",
+          "retry": 2,
+          "retryIntervalInSeconds": 30,
+          "secureInput": false,
+          "secureOutput": false
+        },
+        "userProperties": [
+          {
+            "name": "NotebookPath",
+            "value": "/Repos/data-platform/databricks/notebooks/silver/customer_incremental_etl"
+          }
+        ],
+        "typeProperties": {
+          "notebookPath": "/Repos/data-platform/databricks/notebooks/silver/customer_incremental_etl",
+          "baseParameters": {
+            "load_type": {
+              "value": "@pipeline().parameters.LoadType",
+              "type": "Expression"
+            },
+            "pipeline_run_id": {
+              "value": "@pipeline().RunId",
+              "type": "Expression"
+            },
+            "pipeline_trigger_time": {
+              "value": "@pipeline().TriggerTime",
+              "type": "Expression"
+            }
+          },
+          "new_cluster_config": {
+            "spark_version": "11.3.x-scala2.12",
+            "node_type_id": "i3.xlarge",
+            "num_workers": 2,
+            "aws_attributes": {
+              "availability": "SPOT_WITH_FALLBACK"
+            },
+            "spark_conf": {
+              "spark.databricks.cluster.profile": "singleNode",
+              "spark.sql.shuffle.partitions": "200"
+            }
+          }
+        }
+      },
+      {
+        "name": "LogETLSuccess",
+        "type": "AppendVariable",
+        "dependsOn": [
+          {
+            "activity": "ExecuteCustomerETLNotebook",
+            "dependencyConditions": ["Succeeded"]
+          }
+        ],
+        "policy": {
+          "timeout": "7.00:00:00",
+          "retry": 0,
+          "retryIntervalInSeconds": 30,
+          "secureInput": false,
+          "secureOutput": false
+        },
+        "typeProperties": {
+          "variableName": "PipelineLog",
+          "value": "✅ ETL notebook executed successfully"
+        }
+      },
+      {
+        "name": "LogETLFailure",
+        "type": "AppendVariable",
+        "dependsOn": [
+          {
+            "activity": "ExecuteCustomerETLNotebook",
+            "dependencyConditions": ["Failed"]
+          }
+        ],
+        "policy": {
+          "timeout": "7.00:00:00",
+          "retry": 0,
+          "retryIntervalInSeconds": 30,
+          "secureInput": false,
+          "secureOutput": false
+        },
+        "typeProperties": {
+          "variableName": "PipelineLog",
+          "value": "❌ ETL notebook failed - Check Databricks logs for details"
+        }
+      },
+      {
+        "name": "ValidateETLOutput",
+        "type": "IfCondition",
+        "dependsOn": [
+          {
+            "activity": "ExecuteCustomerETLNotebook",
+            "dependencyConditions": ["Succeeded"]
+          }
+        ],
+        "policy": {
+          "timeout": "7.00:00:00",
+          "retry": 0,
+          "retryIntervalInSeconds": 30,
+          "secureInput": false,
+          "secureOutput": false
+        },
+        "typeProperties": {
+          "expression": {
+            "value": "@activity('ExecuteCustomerETLNotebook').output.runPageUrl",
+            "type": "Expression"
+          },
+          "ifTrueActivities": [
+            {
+              "name": "LogValidationSuccess",
+              "type": "AppendVariable",
+              "policy": {
+                "timeout": "7.00:00:00",
+                "retry": 0,
+                "retryIntervalInSeconds": 30,
+                "secureInput": false,
+                "secureOutput": false
+              },
+              "typeProperties": {
+                "variableName": "PipelineLog",
+                "value": "✅ Output validation passed"
+              }
+            }
+          ]
+        }
+      },
+      {
+        "name": "SendNotification",
+        "type": "WebActivity",
+        "dependsOn": [
+          {
+            "activity": "ValidateETLOutput",
+            "dependencyConditions": ["Completed"]
+          }
+        ],
+        "policy": {
+          "timeout": "7.00:00:00",
+          "retry": 0,
+          "retryIntervalInSeconds": 30,
+          "secureInput": true,
+          "secureOutput": false
+        },
+        "typeProperties": {
+          "url": {
+            "value": "@pipeline().parameters.NotificationWebhookUrl",
+            "type": "Expression"
+          },
+          "method": "POST",
+          "headers": {
+            "Content-Type": "application/json"
+          },
+          "body": {
+            "value": "{\n  \"pipelineRunId\": \"@{pipeline().RunId}\",\n  \"pipelineName\": \"@{pipeline().Pipeline}\",\n  \"status\": \"@{if(equals(activity('ExecuteCustomerETLNotebook').status, 'Succeeded'), 'SUCCESS', 'FAILED')}\",\n  \"loadType\": \"@{pipeline().parameters.LoadType}\",\n  \"executionTime\": \"@{utcNow('yyyy-MM-dd HH:mm:ss')}\",\n  \"logs\": \"@{variables('PipelineLog')}\"\n}",
+            "type": "Expression"
+          }
+        }
+      },
+      {
+        "name": "FailPipelineOnError",
+        "type": "IfCondition",
+        "dependsOn": [
+          {
+            "activity": "ExecuteCustomerETLNotebook",
+            "dependencyConditions": ["Failed"]
+          }
+        ],
+        "policy": {
+          "timeout": "7.00:00:00",
+          "retry": 0,
+          "retryIntervalInSeconds": 30,
+          "secureInput": false,
+          "secureOutput": false
+        },
+        "typeProperties": {
+          "expression": {
+            "value": "@pipeline().parameters.FailOnError",
+            "type": "Expression"
+          },
+          "ifTrueActivities": [
+            {
+              "name": "RaiseError",
+              "type": "Fail",
+              "policy": {
+                "timeout": "7.00:00:00",
+                "retry": 0,
+                "retryIntervalInSeconds": 30,
+                "secureInput": false,
+                "secureOutput": false
+              },
+              "typeProperties": {
+                "message": "ETL Pipeline Failed - Customer Incremental ETL notebook execution failed",
+                "errorCode": "ETL_EXECUTION_FAILED"
+              }
+            }
+          ]
+        }
+      }
+    ],
+    "parameters": {
+      "LoadType": {
+        "type": "string",
+        "defaultValue": "incremental"
+      },
+      "NotificationWebhookUrl": {
+        "type": "string",
+        "defaultValue": ""
+      },
+      "FailOnError": {
+        "type": "bool",
+        "defaultValue": true
+      }
+    },
+    "variables": {
+      "PipelineLog": {
+        "type": "Array"
+      }
+    },
+    "folder": {
+      "name": "Customer/ETL"
+    }
+  }
+}
